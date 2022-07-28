@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/gorilla/mux"
 )
 
 type Livro struct {
@@ -28,16 +30,27 @@ func main() {
 }
 
 func configServer() {
-	configRouter()
+	route := mux.NewRouter().StrictSlash(true)
+	route.Use(jsonContentType)
+	configRouter(route)
 
-	fmt.Println("Listening on port 1337")
-	log.Fatal(http.ListenAndServe(":1337", nil))
+	fmt.Println("Listening on port 8081")
+	log.Fatal(http.ListenAndServe(":8081", route))
 }
 
-func configRouter() {
-	http.HandleFunc("/", RouteMain)
-	http.HandleFunc("/livros", RouteBook)
-	http.HandleFunc("/livros/", RouteBook)
+func jsonContentType(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func configRouter(route *mux.Router) {
+
+	route.HandleFunc("/", RouteMain).Methods("GET")
+	route.HandleFunc("/livros", booksHandler).Methods("GET")
+	route.HandleFunc("/livros", createBookHandler).Methods("POST")
+	route.HandleFunc("/livros/{id}", RouteBook).Methods("GET", "PUT", "DELETE")
 }
 
 func GetBookHandler(w http.ResponseWriter, r *http.Request) {
@@ -58,32 +71,19 @@ func GetBookHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func RouteMain(w http.ResponseWriter, r *http.Request) {
-	http.HandleFunc("/livros", RouteBook)
+	fmt.Fprintf(w, "Hello World")
 }
 
 func RouteBook(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	partes := strings.Split(r.URL.Path, "/")
-
-	if len(partes) == 2 || len(partes) == 3 && partes[2] == "" {
-		if r.Method == "GET" {
-			booksHandler(w, r)
-		} else if r.Method == "POST" {
-			createBookHandler(w, r)
-		}
-	} else if len(partes) == 3 || len(partes) == 4 && partes[3] == "" {
-		switch r.Method {
-		case "GET":
-			GetBookHandler(w, r)
-		case "PUT":
-			updateBookHandler(w, r)
-		case "DELETE":
-			deleteBookHandler(w, r)
-		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
-		}
-	} else {
-		w.WriteHeader(http.StatusNotFound)
+	switch r.Method {
+	case "GET":
+		GetBookHandler(w, r)
+	case "PUT":
+		updateBookHandler(w, r)
+	case "DELETE":
+		deleteBookHandler(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
