@@ -1,14 +1,17 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 )
 
@@ -18,14 +21,56 @@ type Livro struct {
 	Autor  string `json:"autor"`
 }
 
-var Livros []Livro = []Livro{
-	Livro{Id: 1, Titulo: "Harry Potter e a Ordem da Fênix", Autor: "J.K. Rowling"},
-	Livro{Id: 2, Titulo: "O Senhor dos Anéis", Autor: "J.R.R. Tolkien"},
-	Livro{Id: 3, Titulo: "O Hobbit", Autor: "J.R.R. Tolkien"},
-	Livro{Id: 4, Titulo: "O Senhor dos Anéis", Autor: "J.R.R. Tolkien"},
+type ErrorReturn struct {
+	Error string `json:"error"`
+}
+
+type configdb struct {
+	Host     string `json:"host"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	Database string `json:"database"`
+}
+
+var db *sql.DB
+
+func configDB() {
+	var erroAbertura error
+	dat, err := os.ReadFile("config/env.json")
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var config map[string]string
+	err = json.Unmarshal(dat, &config)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	configdb := configdb{
+		Host:     config["DB_HOST_COM_PORTA"],
+		User:     config["DB_USUARIO"],
+		Password: config["DB_SENHA"],
+		Database: config["DB_BANCO_DE_DADOS"],
+	}
+
+	db, erroAbertura = sql.Open("mysql", configdb.User+":"+configdb.Password+"@tcp("+configdb.Host+")/"+configdb.Database)
+
+	if erroAbertura != nil {
+		log.Fatal(erroAbertura.Error())
+	}
+
+	erroPing := db.Ping()
+
+	if erroPing != nil {
+		log.Fatal(erroPing.Error())
+	}
 }
 
 func main() {
+	configDB()
 	configServer()
 }
 
@@ -54,19 +99,23 @@ func configRouter(route *mux.Router) {
 }
 
 func GetBookHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println(r.URL.Path)
+	vars := mux.Vars(r)
 
-	partes := strings.Split(r.URL.Path, "/")
+	id, _ := strconv.Atoi(vars["id"])
 
-	id, _ := strconv.Atoi(partes[2])
+	result := db.QueryRow("SELECT l.id, l.autor, l.titulo FROM livros l WHERE id = ?", id)
+	var livro Livro
 
-	for _, livro := range Livros {
-		if livro.Id == id {
-			json.NewEncoder(w).Encode(livro)
-			return
-		}
+	err := result.Scan(&livro.Id, &livro.Autor, &livro.Titulo)
+
+	if err != nil {
+		fmt.Println(err)
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
-	w.WriteHeader(http.StatusNotFound)
+
+	encoder := json.NewEncoder(w)
+	encoder.Encode(livro)
 
 }
 
@@ -88,32 +137,107 @@ func RouteBook(w http.ResponseWriter, r *http.Request) {
 }
 
 func booksHandler(w http.ResponseWriter, r *http.Request) {
+	reg, err := db.Query("SELECT id, autor, titulo FROM livros")
+
+	if err != nil {
+		fmt.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	var livros []Livro = make([]Livro, 0)
+	for reg.Next() {
+		var livro Livro
+		err := reg.Scan(&livro.Id, &livro.Autor, &livro.Titulo)
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		livros = append(livros, livro)
+	}
+
+	defer reg.Close()
+
 	encoder := json.NewEncoder(w)
-	encoder.Encode(Livros)
+	encoder.Encode(livros)
+}
+
+func validacaoLivro(novolivro Livro) []string {
+
+	erros := make([]string, 0)
+
+	if len(novolivro.Titulo) == 0 {
+		erros = append(erros, "Titulo não pode ser vazio")
+	}
+
+	if len(novolivro.Autor) == 0 {
+		erros = append(erros, "Autor não pode ser vazio")
+	}
+
+	if len(novolivro.Autor) > 100 {
+		erros = append(erros, "Autor não pode ter mais de 100 caracteres")
+	}
+
+	if len(novolivro.Titulo) > 100 {
+		erros = append(erros, "Titulo não pode ter mais de 100 caracteres")
+	}
+
+	return erros
 }
 
 func createBookHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusCreated)
-
 	body, erro := ioutil.ReadAll(r.Body)
 	if erro != nil {
-		fmt.Println(erro)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	var novolivro Livro
-	json.Unmarshal(body, &novolivro)
-	novolivro.Id = len(Livros) + 1
-	Livros = append(Livros, novolivro)
+	erro = json.Unmarshal(body, &novolivro)
+
+	if erro != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	erroValidacao := validacaoLivro(novolivro)
+
+	if len(erroValidacao) > 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		encoder := json.NewEncoder(w)
+		encoder.Encode(ErrorReturn{Error: strings.Join(erroValidacao, "; ")})
+		return
+	}
+
+	result, errorInsert := db.Exec("INSERT INTO livros (autor, titulo) VALUES (?, ?)", novolivro.Autor, novolivro.Titulo)
+
+	idNovoLivro, errorLastInsertId := result.LastInsertId()
+
+	if errorInsert != nil || errorLastInsertId != nil {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		json.NewEncoder(w).Encode(ErrorReturn{Error: "Erro ao criar livro"})
+		return
+	}
+
+	novolivro.Id = int(idNovoLivro)
+
+	w.WriteHeader(http.StatusCreated)
 
 	encoder := json.NewEncoder(w)
 	encoder.Encode(novolivro)
 }
 
 func updateBookHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println(r.URL.Path)
-	partes := strings.Split(r.URL.Path, "/")
-	id, err := strconv.Atoi(partes[2])
+	vars := mux.Vars(r)
+	id, erro := strconv.Atoi(vars["id"])
+
+	if erro != nil {
+		fmt.Println(erro)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
 	body, err := ioutil.ReadAll(r.Body)
 
@@ -123,8 +247,8 @@ func updateBookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var modBook Livro
-	erroJson := json.Unmarshal(body, &modBook)
+	var livroMod Livro
+	erroJson := json.Unmarshal(body, &livroMod)
 
 	if erroJson != nil {
 		fmt.Println(erroJson)
@@ -132,53 +256,57 @@ func updateBookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := -1
-	for i, livro := range Livros {
-		if livro.Id == id {
-			key = i
-			break
-		}
-	}
+	reg := db.QueryRow("SELECT l.id, l.autor, l.titulo FROM livros l WHERE id = ?", id)
 
-	if key < 0 {
+	var livro Livro
+
+	errScan := reg.Scan(&livro.Id, &livro.Autor, &livro.Titulo)
+
+	if errScan != nil {
+		fmt.Println(errScan)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	Livros[key] = modBook
+	_, errExec := db.Exec("UPDATE livros SET autor = ?, titulo = ? WHERE id = ?", livroMod.Autor, livroMod.Titulo, id)
 
-	w.WriteHeader(http.StatusAccepted)
+	if errExec != nil {
+		fmt.Println(errExec)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
-	json.NewEncoder(w).Encode(modBook)
+	json.NewEncoder(w).Encode(livroMod)
 }
 
 func deleteBookHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println(r.URL.Path)
-	partes := strings.Split(r.URL.Path, "/")
-
-	id, erro := strconv.Atoi(partes[2])
+	vars := mux.Vars(r)
+	id, erro := strconv.Atoi(vars["id"])
 
 	if erro != nil {
+		fmt.Println(erro)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	key := -1
-	for i, livro := range Livros {
-		if livro.Id == id {
-			key = i
-			break
-		}
-	}
+	reg := db.QueryRow("SELECT l.id FROM livros l WHERE id = ?", id)
 
-	if key < 0 {
+	var livro_id int
+
+	errScan := reg.Scan(&livro_id)
+
+	if errScan != nil {
+		fmt.Println(errScan)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	leftSide := Livros[0:key]
-	rightSide := Livros[key+1 : len(Livros)]
+	_, errExec := db.Exec("DELETE FROM livros WHERE id = ?", livro_id)
 
-	Livros = append(leftSide, rightSide...)
+	if errExec != nil {
+		fmt.Println(errExec)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
